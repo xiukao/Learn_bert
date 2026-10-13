@@ -546,8 +546,14 @@ def create_attention_mask_from_input_mask(from_tensor, to_mask):
   # tokens so we create a tensor of all ones.
   #
   # `broadcast_ones` = [batch_size, from_seq_length, 1]
+  # broadcast_ones = tf.ones(
+  #     shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+  # 原本传入 tf.ones() 的是一个 Python 列表，其中 batch_size 是尚未得到具体数值的 Tensor
+  #修改后，tf.stack() 会把这三个维度组合成 TensorFlow 的张量，让 TensorFlow 自己处理动态形状，而不是让 NumPy 尝试进行转换
+
   broadcast_ones = tf.ones(
-      shape=[batch_size, from_seq_length, 1], dtype=tf.float32)
+      shape=tf.stack([batch_size, from_seq_length, 1]),
+      dtype=tf.float32)
 
   # Here we broadcast along two dimensions to create the mask.
   mask = broadcast_ones * to_mask

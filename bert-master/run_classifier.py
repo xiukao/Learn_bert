@@ -20,7 +20,12 @@ from __future__ import print_function
 
 import collections
 import csv
+import math
 import os
+import random
+import experiment_utils
+import task_metrics
+import numpy as np
 import modeling
 import optimization
 import tokenization
@@ -42,6 +47,10 @@ flags.DEFINE_string(
     "This specifies the model architecture.")
 
 flags.DEFINE_string("task_name", None, "The name of the task to train.")
+flags.DEFINE_bool(
+    "eval_mismatched", True,
+    "For MNLI, also evaluate the mismatched development split.")
+flags.DEFINE_integer("random_seed", 42, "Python, NumPy and TensorFlow seed.")
 
 flags.DEFINE_string("vocab_file", None,
                     "The vocabulary file that the BERT model was trained on.")
@@ -266,10 +275,20 @@ class MnliProcessor(DataProcessor):
         self._read_tsv(os.path.join(data_dir, "dev_matched.tsv")),
         "dev_matched")
 
+  def get_dev_mismatched_examples(self, data_dir):
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "dev_mismatched.tsv")),
+        "dev_mismatched")
+
   def get_test_examples(self, data_dir):
     """See base class."""
     return self._create_examples(
         self._read_tsv(os.path.join(data_dir, "test_matched.tsv")), "test")
+
+  def get_test_mismatched_examples(self, data_dir):
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "test_mismatched.tsv")),
+        "test_mismatched")
 
   def get_labels(self):
     """See base class."""
@@ -284,7 +303,7 @@ class MnliProcessor(DataProcessor):
       guid = "%s-%s" % (set_type, tokenization.convert_to_unicode(line[0]))
       text_a = tokenization.convert_to_unicode(line[8])
       text_b = tokenization.convert_to_unicode(line[9])
-      if set_type == "test":
+      if set_type.startswith("test"):
         label = "contradiction"
       else:
         label = tokenization.convert_to_unicode(line[-1])
@@ -374,8 +393,111 @@ class ColaProcessor(DataProcessor):
     return examples
 
 
+class HeaderGlueProcessor(DataProcessor):
+  """Reads a GLUE TSV by column name so train and test layouts may differ."""
+
+  text_a_column = None
+  text_b_column = None
+  label_column = "label"
+  label_values = ()
+  regression = False
+  skip_incomplete_rows = False
+
+  def get_train_examples(self, data_dir):
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "train.tsv")), "train")
+
+  def get_dev_examples(self, data_dir):
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "dev.tsv")), "dev")
+
+  def get_test_examples(self, data_dir):
+    return self._create_examples(
+        self._read_tsv(os.path.join(data_dir, "test.tsv")), "test")
+
+  def get_labels(self):
+    return list(self.label_values)
+
+  def _create_examples(self, lines, set_type):
+    if not lines:
+      raise ValueError("Empty GLUE TSV for %s" % set_type)
+    columns = {name.strip().lstrip("\ufeff"): index
+               for index, name in enumerate(lines[0])}
+    required = [self.text_a_column]
+    if self.text_b_column:
+      required.append(self.text_b_column)
+    if set_type != "test":
+      required.append(self.label_column)
+    missing = [name for name in required if name not in columns]
+    if missing:
+      raise ValueError("Missing GLUE columns: %s" % ", ".join(missing))
+    examples = []
+    for row_number, row in enumerate(lines[1:], 1):
+      try:
+        text_a = row[columns[self.text_a_column]]
+        text_b = (row[columns[self.text_b_column]]
+                  if self.text_b_column else None)
+        label = (row[columns[self.label_column]]
+                 if set_type != "test" else
+                 ("0.0" if self.regression else self.label_values[0]))
+        guid = row[columns["index"]] if "index" in columns else str(row_number)
+      except IndexError:
+        if self.skip_incomplete_rows and set_type != "test":
+          tf.logging.warning("Skipping incomplete GLUE row %d in %s",
+                             row_number + 1, set_type)
+          continue
+        raise ValueError("Incomplete GLUE row %d in %s" %
+                         (row_number + 1, set_type))
+      if not text_a or (self.text_b_column and not text_b):
+        if self.skip_incomplete_rows and set_type != "test":
+          tf.logging.warning("Skipping empty GLUE row %d in %s",
+                             row_number + 1, set_type)
+          continue
+        raise ValueError("Empty text in GLUE row %d in %s" %
+                         (row_number + 1, set_type))
+      examples.append(InputExample(
+          guid="%s-%s" % (set_type, guid),
+          text_a=tokenization.convert_to_unicode(text_a),
+          text_b=(tokenization.convert_to_unicode(text_b)
+                  if text_b is not None else None),
+          label=tokenization.convert_to_unicode(label)))
+    return examples
+
+
+class Sst2Processor(HeaderGlueProcessor):
+  text_a_column = "sentence"
+  label_values = ("0", "1")
+
+
+class QqpProcessor(HeaderGlueProcessor):
+  text_a_column = "question1"
+  text_b_column = "question2"
+  label_column = "is_duplicate"
+  label_values = ("0", "1")
+  skip_incomplete_rows = True
+
+
+class QnliProcessor(HeaderGlueProcessor):
+  text_a_column = "question"
+  text_b_column = "sentence"
+  label_values = ("entailment", "not_entailment")
+
+
+class RteProcessor(HeaderGlueProcessor):
+  text_a_column = "sentence1"
+  text_b_column = "sentence2"
+  label_values = ("entailment", "not_entailment")
+
+
+class StsbProcessor(HeaderGlueProcessor):
+  text_a_column = "sentence1"
+  text_b_column = "sentence2"
+  label_column = "score"
+  regression = True
+
+
 def convert_single_example(ex_index, example, label_list, max_seq_length,
-                           tokenizer):
+                           tokenizer, output_mode="classification"):
   """Converts a single `InputExample` into a single `InputFeatures`."""
 
   if isinstance(example, PaddingInputExample):
@@ -387,8 +509,9 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
         is_real_example=False)
 
   label_map = {}
-  for (i, label) in enumerate(label_list):
-    label_map[label] = i
+  if output_mode == "classification":
+    for (i, label) in enumerate(label_list):
+      label_map[label] = i
 
   tokens_a = tokenizer.tokenize(example.text_a)
   tokens_b = None
@@ -456,7 +579,8 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
   assert len(input_mask) == max_seq_length
   assert len(segment_ids) == max_seq_length
 
-  label_id = label_map[example.label]
+  label_id = (float(example.label) if output_mode == "regression"
+              else label_map[example.label])
   if ex_index < 5:
     tf.logging.info("*** Example ***")
     tf.logging.info("guid: %s" % (example.guid))
@@ -465,7 +589,7 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
     tf.logging.info("input_ids: %s" % " ".join([str(x) for x in input_ids]))
     tf.logging.info("input_mask: %s" % " ".join([str(x) for x in input_mask]))
     tf.logging.info("segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
-    tf.logging.info("label: %s (id = %d)" % (example.label, label_id))
+    tf.logging.info("label: %s (value = %s)" % (example.label, label_id))
 
   feature = InputFeatures(
       input_ids=input_ids,
@@ -477,7 +601,8 @@ def convert_single_example(ex_index, example, label_list, max_seq_length,
 
 
 def file_based_convert_examples_to_features(
-    examples, label_list, max_seq_length, tokenizer, output_file):
+    examples, label_list, max_seq_length, tokenizer, output_file,
+    output_mode="classification"):
   """Convert a set of `InputExample`s to a TFRecord file."""
 
   writer = tf.python_io.TFRecordWriter(output_file)
@@ -487,7 +612,7 @@ def file_based_convert_examples_to_features(
       tf.logging.info("Writing example %d of %d" % (ex_index, len(examples)))
 
     feature = convert_single_example(ex_index, example, label_list,
-                                     max_seq_length, tokenizer)
+                                     max_seq_length, tokenizer, output_mode)
 
     def create_int_feature(values):
       f = tf.train.Feature(int64_list=tf.train.Int64List(value=list(values)))
@@ -497,7 +622,11 @@ def file_based_convert_examples_to_features(
     features["input_ids"] = create_int_feature(feature.input_ids)
     features["input_mask"] = create_int_feature(feature.input_mask)
     features["segment_ids"] = create_int_feature(feature.segment_ids)
-    features["label_ids"] = create_int_feature([feature.label_id])
+    if output_mode == "regression":
+      features["label_ids"] = tf.train.Feature(
+          float_list=tf.train.FloatList(value=[feature.label_id]))
+    else:
+      features["label_ids"] = create_int_feature([feature.label_id])
     features["is_real_example"] = create_int_feature(
         [int(feature.is_real_example)])
 
@@ -507,14 +636,16 @@ def file_based_convert_examples_to_features(
 
 
 def file_based_input_fn_builder(input_file, seq_length, is_training,
-                                drop_remainder):
+                                drop_remainder,
+                                output_mode="classification"):
   """Creates an `input_fn` closure to be passed to TPUEstimator."""
 
   name_to_features = {
       "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
       "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
       "segment_ids": tf.FixedLenFeature([seq_length], tf.int64),
-      "label_ids": tf.FixedLenFeature([], tf.int64),
+      "label_ids": tf.FixedLenFeature(
+          [], tf.float32 if output_mode == "regression" else tf.int64),
       "is_real_example": tf.FixedLenFeature([], tf.int64),
   }
 
@@ -572,8 +703,9 @@ def _truncate_seq_pair(tokens_a, tokens_b, max_length):
 
 
 def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
-                 labels, num_labels, use_one_hot_embeddings):
-  """Creates a classification model."""
+                 labels, num_labels, use_one_hot_embeddings,
+                 output_mode="classification"):
+  """Creates a classification or regression model."""
   model = modeling.BertModel(
       config=bert_config,
       is_training=is_training,
@@ -605,12 +737,14 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
     logits = tf.matmul(output_layer, output_weights, transpose_b=True)
     logits = tf.nn.bias_add(logits, output_bias)
-    probabilities = tf.nn.softmax(logits, axis=-1)
-    log_probs = tf.nn.log_softmax(logits, axis=-1)
-
-    one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
-
-    per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+    if output_mode == "regression":
+      probabilities = tf.squeeze(logits, axis=-1)
+      per_example_loss = tf.square(probabilities - tf.cast(labels, tf.float32))
+    else:
+      probabilities = tf.nn.softmax(logits, axis=-1)
+      log_probs = tf.nn.log_softmax(logits, axis=-1)
+      one_hot_labels = tf.one_hot(labels, depth=num_labels, dtype=tf.float32)
+      per_example_loss = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
 
     return (loss, per_example_loss, logits, probabilities)
@@ -618,7 +752,7 @@ def create_model(bert_config, is_training, input_ids, input_mask, segment_ids,
 
 def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
                      num_train_steps, num_warmup_steps, use_tpu,
-                     use_one_hot_embeddings):
+                     use_one_hot_embeddings, output_mode="classification"):
   """Returns `model_fn` closure for TPUEstimator."""
 
   def model_fn(features, labels, mode, params):  # pylint: disable=unused-argument
@@ -642,7 +776,7 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
     (total_loss, per_example_loss, logits, probabilities) = create_model(
         bert_config, is_training, input_ids, input_mask, segment_ids, label_ids,
-        num_labels, use_one_hot_embeddings)
+        num_labels, use_one_hot_embeddings, output_mode)
 
     tvars = tf.trainable_variables()
     initialized_variable_names = {}
@@ -682,14 +816,13 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
     elif mode == tf.estimator.ModeKeys.EVAL:
 
       def metric_fn(per_example_loss, label_ids, logits, is_real_example):
+        loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
+        if output_mode == "regression":
+          return {"eval_mse": loss}
         predictions = tf.argmax(logits, axis=-1, output_type=tf.int32)
         accuracy = tf.metrics.accuracy(
             labels=label_ids, predictions=predictions, weights=is_real_example)
-        loss = tf.metrics.mean(values=per_example_loss, weights=is_real_example)
-        return {
-            "eval_accuracy": accuracy,
-            "eval_loss": loss,
-        }
+        return {"eval_accuracy": accuracy, "eval_loss": loss}
 
       eval_metrics = (metric_fn,
                       [per_example_loss, label_ids, logits, is_real_example])
@@ -780,13 +913,46 @@ def convert_examples_to_features(examples, label_list, max_seq_length,
   return features
 
 
+def write_glue_submission(result_file, test_file, output_file, label_list,
+                          output_mode):
+  """Convert raw model outputs to GLUE's index/prediction TSV format."""
+  with tf.gfile.Open(test_file, "r") as stream:
+    rows = list(csv.reader(stream, delimiter="\t"))
+  if not rows:
+    raise ValueError("Empty GLUE test file: %s" % test_file)
+  index_column = rows[0].index("index") if "index" in rows[0] else 0
+  indices = [row[index_column] for row in rows[1:]]
+  with tf.gfile.Open(result_file, "r") as stream:
+    predictions = list(csv.reader(stream, delimiter="\t"))
+  if len(indices) != len(predictions):
+    raise ValueError("GLUE test and prediction counts differ")
+  with tf.gfile.GFile(output_file, "w") as stream:
+    writer = csv.writer(stream, delimiter="\t", lineterminator="\n")
+    writer.writerow(["index", "prediction"])
+    for index, scores in zip(indices, predictions):
+      if output_mode == "regression":
+        prediction = min(5.0, max(0.0, float(scores[0])))
+      else:
+        prediction = label_list[max(
+            range(len(scores)), key=lambda position: float(scores[position]))]
+      writer.writerow([index, prediction])
+
+
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
+  random.seed(FLAGS.random_seed)
+  np.random.seed(FLAGS.random_seed)
+  tf.set_random_seed(FLAGS.random_seed)
 
   processors = {
       "cola": ColaProcessor,
       "mnli": MnliProcessor,
       "mrpc": MrpcProcessor,
+      "qqp": QqpProcessor,
+      "qnli": QnliProcessor,
+      "sst-2": Sst2Processor,
+      "sts-b": StsbProcessor,
+      "rte": RteProcessor,
       "xnli": XnliProcessor,
   }
 
@@ -806,6 +972,7 @@ def main(_):
         (FLAGS.max_seq_length, bert_config.max_position_embeddings))
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
+  experiment_utils.save_effective_flags(FLAGS, FLAGS.output_dir)
 
   task_name = FLAGS.task_name.lower()
 
@@ -815,6 +982,7 @@ def main(_):
   processor = processors[task_name]()
 
   label_list = processor.get_labels()
+  output_mode = "regression" if task_name == "sts-b" else "classification"
 
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -843,16 +1011,21 @@ def main(_):
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+    experiment_utils.save_computed(FLAGS.output_dir, {
+        "train_examples": len(train_examples),
+        "num_train_steps": num_train_steps,
+        "num_warmup_steps": num_warmup_steps})
 
   model_fn = model_fn_builder(
       bert_config=bert_config,
-      num_labels=len(label_list),
+      num_labels=1 if output_mode == "regression" else len(label_list),
       init_checkpoint=FLAGS.init_checkpoint,
       learning_rate=FLAGS.learning_rate,
       num_train_steps=num_train_steps,
       num_warmup_steps=num_warmup_steps,
       use_tpu=FLAGS.use_tpu,
-      use_one_hot_embeddings=FLAGS.use_tpu)
+      use_one_hot_embeddings=FLAGS.use_tpu,
+      output_mode=output_mode)
 
   # If TPU is not available, this will fall back to normal Estimator on CPU
   # or GPU.
@@ -867,7 +1040,8 @@ def main(_):
   if FLAGS.do_train:
     train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
     file_based_convert_examples_to_features(
-        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file)
+        train_examples, label_list, FLAGS.max_seq_length, tokenizer, train_file,
+        output_mode)
     tf.logging.info("***** Running training *****")
     tf.logging.info("  Num examples = %d", len(train_examples))
     tf.logging.info("  Batch size = %d", FLAGS.train_batch_size)
@@ -876,7 +1050,8 @@ def main(_):
         input_file=train_file,
         seq_length=FLAGS.max_seq_length,
         is_training=True,
-        drop_remainder=True)
+        drop_remainder=True,
+        output_mode=output_mode)
     estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
 
   if FLAGS.do_eval:
@@ -888,12 +1063,16 @@ def main(_):
       # will get dropped. So we pad with fake examples which are ignored
       # later on. These do NOT count towards the metric (all tf.metrics
       # support a per-instance weight, and these get a weight of 0.0).
-      while len(eval_examples) % FLAGS.eval_batch_size != 0:
+      padding_multiple = (FLAGS.eval_batch_size * FLAGS.predict_batch_size //
+                          math.gcd(FLAGS.eval_batch_size,
+                                   FLAGS.predict_batch_size))
+      while len(eval_examples) % padding_multiple != 0:
         eval_examples.append(PaddingInputExample())
 
     eval_file = os.path.join(FLAGS.output_dir, "eval.tf_record")
     file_based_convert_examples_to_features(
-        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file)
+        eval_examples, label_list, FLAGS.max_seq_length, tokenizer, eval_file,
+        output_mode)
 
     tf.logging.info("***** Running evaluation *****")
     tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -914,9 +1093,30 @@ def main(_):
         input_file=eval_file,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
-        drop_remainder=eval_drop_remainder)
+        drop_remainder=eval_drop_remainder,
+        output_mode=output_mode)
 
     result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
+
+    prediction_input_fn = file_based_input_fn_builder(
+        input_file=eval_file, seq_length=FLAGS.max_seq_length,
+        is_training=False, drop_remainder=FLAGS.use_tpu,
+        output_mode=output_mode)
+    raw_predictions = list(estimator.predict(input_fn=prediction_input_fn))
+    if len(raw_predictions) < num_actual_eval_examples:
+      raise ValueError("Evaluation predictions are incomplete")
+    raw_predictions = raw_predictions[:num_actual_eval_examples]
+    if output_mode == "regression":
+      predictions = [float(item["probabilities"])
+                     for item in raw_predictions]
+      labels = [float(item.label) for item in
+                eval_examples[:num_actual_eval_examples]]
+    else:
+      predictions = [int(item["probabilities"].argmax())
+                     for item in raw_predictions]
+      labels = [label_list.index(item.label) for item in
+                eval_examples[:num_actual_eval_examples]]
+    result.update(task_metrics.glue_metrics(task_name, labels, predictions))
 
     output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
     with tf.gfile.GFile(output_eval_file, "w") as writer:
@@ -924,6 +1124,37 @@ def main(_):
       for key in sorted(result.keys()):
         tf.logging.info("  %s = %s", key, str(result[key]))
         writer.write("%s = %s\n" % (key, str(result[key])))
+
+    if task_name == "mnli" and FLAGS.eval_mismatched:
+      mm_examples = processor.get_dev_mismatched_examples(FLAGS.data_dir)
+      mm_count = len(mm_examples)
+      if FLAGS.use_tpu:
+        while len(mm_examples) % padding_multiple != 0:
+          mm_examples.append(PaddingInputExample())
+      mm_file = os.path.join(FLAGS.output_dir, "eval_mismatched.tf_record")
+      file_based_convert_examples_to_features(
+          mm_examples, label_list, FLAGS.max_seq_length, tokenizer, mm_file,
+          output_mode)
+      mm_input_fn = file_based_input_fn_builder(
+          mm_file, FLAGS.max_seq_length, False, FLAGS.use_tpu, output_mode)
+      mm_steps = (len(mm_examples) // FLAGS.eval_batch_size
+                  if FLAGS.use_tpu else None)
+      mm_result = estimator.evaluate(input_fn=mm_input_fn, steps=mm_steps)
+      mm_predict_input_fn = file_based_input_fn_builder(
+          mm_file, FLAGS.max_seq_length, False, FLAGS.use_tpu, output_mode)
+      mm_predictions = list(estimator.predict(
+          input_fn=mm_predict_input_fn))[:mm_count]
+      if len(mm_predictions) != mm_count:
+        raise ValueError("MNLI mismatched predictions are incomplete")
+      mm_result.update(task_metrics.glue_metrics(
+          "mnli",
+          [label_list.index(item.label) for item in mm_examples[:mm_count]],
+          [int(item["probabilities"].argmax()) for item in mm_predictions]))
+      with tf.gfile.GFile(
+          os.path.join(FLAGS.output_dir, "eval_mismatched_results.txt"),
+          "w") as writer:
+        for key in sorted(mm_result.keys()):
+          writer.write("%s = %s\n" % (key, str(mm_result[key])))
 
   if FLAGS.do_predict:
     predict_examples = processor.get_test_examples(FLAGS.data_dir)
@@ -939,7 +1170,7 @@ def main(_):
     predict_file = os.path.join(FLAGS.output_dir, "predict.tf_record")
     file_based_convert_examples_to_features(predict_examples, label_list,
                                             FLAGS.max_seq_length, tokenizer,
-                                            predict_file)
+                                            predict_file, output_mode)
 
     tf.logging.info("***** Running prediction*****")
     tf.logging.info("  Num examples = %d (%d actual, %d padding)",
@@ -952,7 +1183,8 @@ def main(_):
         input_file=predict_file,
         seq_length=FLAGS.max_seq_length,
         is_training=False,
-        drop_remainder=predict_drop_remainder)
+        drop_remainder=predict_drop_remainder,
+        output_mode=output_mode)
 
     result = estimator.predict(input_fn=predict_input_fn)
 
@@ -964,12 +1196,52 @@ def main(_):
         probabilities = prediction["probabilities"]
         if i >= num_actual_predict_examples:
           break
-        output_line = "\t".join(
-            str(class_probability)
-            for class_probability in probabilities) + "\n"
+        if output_mode == "regression":
+          output_line = str(float(probabilities)) + "\n"
+        else:
+          output_line = "\t".join(
+              str(class_probability)
+              for class_probability in probabilities) + "\n"
         writer.write(output_line)
         num_written_lines += 1
     assert num_written_lines == num_actual_predict_examples
+    if task_name != "xnli":
+      test_source = ("test_matched.tsv" if task_name == "mnli"
+                     else "test.tsv")
+      write_glue_submission(
+          output_predict_file, os.path.join(FLAGS.data_dir, test_source),
+          os.path.join(FLAGS.output_dir, "submission.tsv"),
+          label_list, output_mode)
+
+    if task_name == "mnli":
+      mm_test_examples = processor.get_test_mismatched_examples(FLAGS.data_dir)
+      mm_test_count = len(mm_test_examples)
+      if FLAGS.use_tpu:
+        while len(mm_test_examples) % FLAGS.predict_batch_size != 0:
+          mm_test_examples.append(PaddingInputExample())
+      mm_test_file = os.path.join(FLAGS.output_dir,
+                                  "predict_mismatched.tf_record")
+      file_based_convert_examples_to_features(
+          mm_test_examples, label_list, FLAGS.max_seq_length, tokenizer,
+          mm_test_file, output_mode)
+      mm_test_input_fn = file_based_input_fn_builder(
+          mm_test_file, FLAGS.max_seq_length, False, FLAGS.use_tpu,
+          output_mode)
+      with tf.gfile.GFile(
+          os.path.join(FLAGS.output_dir, "test_mismatched_results.tsv"),
+          "w") as writer:
+        for i, prediction in enumerate(
+            estimator.predict(input_fn=mm_test_input_fn)):
+          if i >= mm_test_count:
+            break
+          writer.write("\t".join(
+              str(value) for value in
+              prediction["probabilities"]) + "\n")
+      write_glue_submission(
+          os.path.join(FLAGS.output_dir, "test_mismatched_results.tsv"),
+          os.path.join(FLAGS.data_dir, "test_mismatched.tsv"),
+          os.path.join(FLAGS.output_dir, "submission_mismatched.tsv"),
+          label_list, output_mode)
 
 
 if __name__ == "__main__":

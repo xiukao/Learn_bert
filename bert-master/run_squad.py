@@ -23,11 +23,13 @@ import json
 import math
 import os
 import random
+import experiment_utils
 import modeling
 import optimization
 import tokenization
 import six
 import tensorflow as tf
+import numpy as np
 
 flags = tf.flags
 
@@ -82,6 +84,7 @@ flags.DEFINE_integer(
 flags.DEFINE_bool("do_train", False, "Whether to run training.")
 
 flags.DEFINE_bool("do_predict", False, "Whether to run eval on the dev set.")
+flags.DEFINE_integer("random_seed", 42, "Python, NumPy and TensorFlow seed.")
 
 flags.DEFINE_integer("train_batch_size", 32, "Total batch size for training.")
 
@@ -1125,12 +1128,16 @@ def validate_flags_or_throw(bert_config):
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
+  random.seed(FLAGS.random_seed)
+  np.random.seed(FLAGS.random_seed)
+  tf.set_random_seed(FLAGS.random_seed)
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
 
   validate_flags_or_throw(bert_config)
 
   tf.gfile.MakeDirs(FLAGS.output_dir)
+  experiment_utils.save_effective_flags(FLAGS, FLAGS.output_dir)
 
   tokenizer = tokenization.FullTokenizer(
       vocab_file=FLAGS.vocab_file, do_lower_case=FLAGS.do_lower_case)
@@ -1160,10 +1167,14 @@ def main(_):
     num_train_steps = int(
         len(train_examples) / FLAGS.train_batch_size * FLAGS.num_train_epochs)
     num_warmup_steps = int(num_train_steps * FLAGS.warmup_proportion)
+    experiment_utils.save_computed(FLAGS.output_dir, {
+        "train_examples": len(train_examples),
+        "num_train_steps": num_train_steps,
+        "num_warmup_steps": num_warmup_steps})
 
     # Pre-shuffle the input to avoid having to make a very large shuffle
     # buffer in in the `input_fn`.
-    rng = random.Random(12345)
+    rng = random.Random(FLAGS.random_seed)
     rng.shuffle(train_examples)
 
   model_fn = model_fn_builder(
@@ -1199,6 +1210,8 @@ def main(_):
         is_training=True,
         output_fn=train_writer.process_feature)
     train_writer.close()
+    experiment_utils.save_computed(
+        FLAGS.output_dir, {"train_features": train_writer.num_features})
 
     tf.logging.info("***** Running training *****")
     tf.logging.info("  Num orig examples = %d", len(train_examples))
